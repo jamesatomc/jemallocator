@@ -5,10 +5,14 @@ on:
     branches:
       - 'master'
       - 'main'
+      - 'windows'
+
   push:
     branches:
       - 'master'
       - 'main'
+      - 'windows'
+
 
 jobs:
   test:
@@ -49,16 +53,24 @@ jobs:
             no_tests: 0
             rust: msrv
             tag: ubuntu-latest
+          - name: x86_64-windows-msvc
+            target: x86_64-pc-windows-msvc
+            nobgt: 0
+            no_tests: 1
+            tag: windows-latest
     runs-on: ${{ matrix.tag }}
     env:
       TARGET: ${{ matrix.target }}
       NO_JEMALLOC_TESTS: ${{ matrix.no_tests }}
       NOBGT: ${{ matrix.nobgt }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
-    - name: install
+
+    - name: Install Rust (non-Windows)
+      if: runner.os != 'Windows'
+      shell: bash
       run: |
         if [[ "${{ matrix.rust }}" == "nightly" ]]; then
             rustup default nightly
@@ -70,13 +82,90 @@ jobs:
         if [[ "$TARGET" == "x86_64-unknown-linux-musl" ]]; then
           sudo apt install -y musl-tools
         fi
-    - name: test
+
+    - name: Install Rust (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        # Install appropriate Rust version
+        try {
+            if ("${{ matrix.rust }}" -eq "nightly") {
+                rustup default nightly
+                if ($LASTEXITCODE -ne 0) { throw "Failed to set nightly" }
+            }
+            elseif ("${{ matrix.rust }}" -eq "msrv") {
+                $msrv = (Get-Content jemalloc-sys/Cargo.toml | Select-String 'rust-version').ToString().Split('"')[1]
+                rustup default $msrv
+                if ($LASTEXITCODE -ne 0) { throw "Failed to set MSRV" }
+            }
+            
+            # Install target
+            rustup target add ${{ matrix.target }}
+            if ($LASTEXITCODE -ne 0) { throw "Failed to add target" }
+
+            # For MSVC we need to ensure Visual Studio environment is available
+            if ("${{ matrix.target }}" -like "*msvc*") {
+                # Load VS environment if needed
+                & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+            }
+        }
+        catch {
+            Write-Error "Failed to setup Rust environment: $_"
+            exit 1
+        }
+
+    - name: test (non-Windows)
+      if: runner.os != 'Windows'
+      shell: bash
       run: sh ci/run.sh
+    
+    - name: test (Windows) 
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        try {
+            # Setup VS Developer environment
+            $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+            Import-Module (Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+            Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation
+
+            # Set build environment
+            $env:CARGO_BUILD_TARGET = "${{ matrix.target }}"
+            
+            # Basic build first
+            Write-Host "Building basic target..."
+            cargo build --target "${{ matrix.target }}"
+            if ($LASTEXITCODE -ne 0) { throw "Basic build failed" }
+
+            # Run tests if enabled
+            if ($env:NO_JEMALLOC_TESTS -ne "1") {
+                Write-Host "Running tests..."
+                
+                # Run basic tests
+                cargo test --target "${{ matrix.target }}"
+                if ($LASTEXITCODE -ne 0) { throw "Basic tests failed" }
+
+                # Run tests with different features
+                cargo test --target "${{ matrix.target }}" --features unprefixed_malloc_on_supported_platforms
+                if ($LASTEXITCODE -ne 0) { throw "Feature tests failed" }
+                
+                # Run debug tests
+                cargo test --target "${{ matrix.target }}" --features debug
+                if ($LASTEXITCODE -ne 0) { throw "Debug tests failed" }
+            }
+            else {
+                Write-Host "Skipping tests as NO_JEMALLOC_TESTS=1"
+            }
+        }
+        catch {
+            Write-Error "Test step failed: $_"
+            exit 1
+        }
   test_bench:
     name: Benchmarks using x86_64-unknown-linux-gnu (nightly)
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
     - run: rustup default nightly
@@ -85,7 +174,7 @@ jobs:
     name: Rustfmt and Clippy
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
     - run: rustup component add rustfmt clippy
